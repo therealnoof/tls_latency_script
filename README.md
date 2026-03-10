@@ -17,6 +17,72 @@ curl --version
 openssl version
 ```
 
+> **Note:** Most distro-shipped versions of curl/OpenSSL (e.g. Ubuntu 22.04 ships OpenSSL 3.0.2) do **not** support PQC ciphers. The ECDH tests will still run, but PQC tests will be skipped. See the install guide below to build from source.
+
+## Building curl with OpenSSL 3.5 (PQC Support)
+
+If your system OpenSSL is older than 3.2, you need to build both OpenSSL and curl from source. These steps were tested on Ubuntu 22.04.
+
+### 1. Install build dependencies
+
+```bash
+apt-get update
+apt-get install -y build-essential pkg-config zlib1g-dev
+```
+
+### 2. Build OpenSSL 3.5
+
+```bash
+wget https://www.openssl.org/source/openssl-3.5.0.tar.gz
+tar xzf openssl-3.5.0.tar.gz
+cd openssl-3.5.0
+./Configure --prefix=/usr/local/openssl-3.5
+make -j$(nproc)
+make install
+```
+
+### 3. Build curl 8.x against OpenSSL 3.5
+
+```bash
+wget https://curl.se/download/curl-8.12.1.tar.gz
+tar xzf curl-8.12.1.tar.gz
+cd curl-8.12.1
+
+export PKG_CONFIG_PATH=/usr/local/openssl-3.5/lib64/pkgconfig
+export LD_LIBRARY_PATH=/usr/local/openssl-3.5/lib64
+
+./configure --with-openssl=/usr/local/openssl-3.5 \
+  --without-libpsl \
+  --without-brotli \
+  --without-zstd \
+  --without-libidn2 \
+  --without-librtmp \
+  --without-nghttp2 \
+  --disable-ldap
+
+make -j$(nproc)
+make install
+```
+
+> **Tip:** If OpenSSL installed its libs to `lib/` instead of `lib64/`, swap `lib64` to `lib` in the export lines above. Check with: `ls /usr/local/openssl-3.5/lib64/libssl.* 2>/dev/null || ls /usr/local/openssl-3.5/lib/libssl.*`
+
+### 4. Configure library and binary paths
+
+The new curl installs to `/usr/local/bin/curl` and needs both its own `libcurl` and the OpenSSL 3.5 shared libs at runtime:
+
+```bash
+echo 'export PATH=/usr/local/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/openssl-3.5/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### 5. Verify
+
+```bash
+which curl        # should show /usr/local/bin/curl
+curl --version    # should show curl 8.12.1 ... OpenSSL/3.5.0
+```
+
 ## Test Matrix
 
 | Test Case | TLS Version | Key Exchange Group |
