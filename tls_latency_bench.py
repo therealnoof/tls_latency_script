@@ -181,8 +181,11 @@ def run_single(target: str, test: TestCase, timeout: int = 10,
 
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
-        if r.returncode != 0:
-            return None
+        # curl may exit non-zero if the HTTP request fails after the TLS
+        # handshake (e.g. connection reset by peer, empty reply).  The
+        # timing data is still written to stdout, so we attempt to parse
+        # it regardless of the exit code.  We only bail out if the JSON
+        # is missing or the handshake times are zero (true TLS failure).
         data = json.loads(r.stdout)
         tcp_connect = float(data["time_connect"])
         tls_done = float(data["time_appconnect"])

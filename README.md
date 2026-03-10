@@ -186,6 +186,72 @@ X25519+MLKEM768 hybrid (TLS 1.3)           2.10    2.85    2.70    3.60    4.50 
 - All times in milliseconds (TLS handshake only, TCP connect time excluded)
 - **Δ%** is relative to the first successful test case
 
+## Backend Application (Docker)
+
+A simple nginx container is included in `backend/` for use as an F5 pool member or for direct TLS testing. It listens on HTTP (port 80) and HTTPS (port 443) with a self-signed certificate.
+
+### Install Docker (Ubuntu 22.04)
+
+```bash
+# Remove any old versions
+apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null
+
+# Install prerequisites
+apt-get update
+apt-get install -y ca-certificates curl gnupg
+
+# Add Docker's official GPG key and repo
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install Docker Engine and Compose
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Verify
+docker --version
+docker compose version
+```
+
+### Start the backend
+
+```bash
+cd backend
+docker compose up -d --build
+```
+
+### Verify it's running
+
+```bash
+# Health check (HTTP)
+curl http://localhost/health
+# {"status":"ok"}
+
+# TLS check (HTTPS, self-signed cert)
+curl -k https://localhost/
+# {"service":"tls-latency-backend","proto":"https"}
+```
+
+### Endpoints
+
+| Path | Description |
+|---|---|
+| `GET /` | Returns service info JSON |
+| `GET /health` | Health check endpoint (use for F5 pool monitors) |
+
+Both endpoints are available on port 80 (HTTP) and port 443 (HTTPS).
+
+### Using with F5
+
+Point your F5 pool members at the backend's IP on port 80 (if the F5 handles TLS termination) or port 443 (if using SSL bridging). Set the F5 health monitor to `GET /health` on the appropriate port.
+
 ## How It Works
 
 Uses `curl -w` to extract precise timing breakdowns:
