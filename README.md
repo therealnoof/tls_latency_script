@@ -2,10 +2,15 @@
 
 Measures TLS handshake latency across classical ECDH (TLS 1.2 & 1.3) and Post-Quantum Cryptography (PQC) hybrid key exchanges. Useful for comparing the overhead of PQC migrations on load balancers, VIPs, and CDN endpoints.
 
+Includes two tools:
+- **`tls_latency_bench.py`** — Serial per-handshake latency benchmark across cipher suites
+- **`tls_load_test.py`** — Sustained concurrent load test with BIG-IP CPU/memory metrics collection
+
 ## Requirements
 
 - **Python 3.10+**
 - **curl** built with OpenSSL 3.2+ (for PQC cipher support)
+- **requests** library (for load test BIG-IP metrics): `pip install requests`
   - OpenSSL 3.2-3.4: supports `x25519_kyber768` (draft hybrid)
   - OpenSSL 3.5+: supports `X25519MLKEM768`, `SecP256r1MLKEM768` (standardised ML-KEM)
 - Network access to the target server(s)
@@ -262,3 +267,13 @@ Uses `curl -w` to extract precise timing breakdowns:
 **Handshake latency** = `time_appconnect - time_connect` (isolates TLS negotiation from TCP and DNS).
 
 Each test case runs warmup iterations first (discarded) to prime DNS caches and detect unsupported configurations, then N measured iterations to compute min/avg/median/p95/max/stddev.
+
+## Load Testing (tls_load_test.py)
+
+Generates sustained concurrent TLS handshake load against two VIPs (non-PQC vs PQC) while polling BIG-IP CPU, memory, and TMM metrics via iControl REST API. See [LAB_GUIDE.md](LAB_GUIDE.md) for full usage and example output.
+
+```bash
+python3 tls_load_test.py \
+    --bigip-host 10.1.1.4 --bigip-user admin --bigip-pass admin \
+    -k --duration 300 --workers 4 --csv results.csv
+```

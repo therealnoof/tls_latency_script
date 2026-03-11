@@ -225,3 +225,151 @@ docker compose logs -f
    tmsh show ltm virtual
    tmsh show ltm pool
    ```
+
+---
+
+## Load Testing — BIG-IP CPU & Memory Under PQC Load
+
+The load test script (`tls_load_test.py`) generates sustained concurrent TLS handshake traffic against each VIP while polling BIG-IP system metrics via iControl REST API. This measures the real CPU and memory cost of PQC key exchanges under load.
+
+### Architecture
+
+```
+┌──────────────────────────────────────┐
+│           Test Server                │
+│                                      │
+│  tls_load_test.py                    │
+│  ├── Worker 1 ─── curl handshakes ──────────┐
+│  ├── Worker 2 ─── curl handshakes ──────────┤
+│  ├── Worker 3 ─── curl handshakes ──────────┤    ┌─────────────┐
+│  ├── Worker 4 ─── curl handshakes ──────────┼───►│  BIG-IP VIP │
+│  │                                   │       │    └──────┬──────┘
+│  └── Metrics thread ────── iControl REST ───────►│  BIG-IP Mgmt│
+│       (polls CPU/mem/TMM every 5s)   │       │   │  10.1.1.4   │
+└──────────────────────────────────────┘       │   └─────────────┘
+                                               │
+                                               ▼
+                                        ┌─────────────┐
+                                        │  App Server  │
+                                        │  (Docker)    │
+                                        └─────────────┘
+```
+
+### Prerequisites
+
+Install the `requests` library on the test server:
+
+```bash
+pip install requests
+```
+
+### Running the Load Test
+
+```bash
+cd /home/ubuntu/tls_latency_script
+```
+
+#### Standard 5-minute test (default settings)
+
+```bash
+python3 tls_load_test.py \
+    --bigip-host 10.1.1.4 \
+    --bigip-user admin \
+    --bigip-pass admin \
+    -k
+```
+
+This runs:
+1. **Scenario 1** — 5 minutes of concurrent X25519 (non-PQC) handshakes to 10.1.10.20
+2. **30-second pause** — lets BIG-IP return to baseline
+3. **Scenario 2** — 5 minutes of concurrent X25519+MLKEM768 (PQC) handshakes to 10.1.10.30
+4. **Comparison report** — side-by-side throughput, latency, and BIG-IP resource usage
+
+#### Quick smoke test (2 minutes, fewer workers)
+
+```bash
+python3 tls_load_test.py \
+    --bigip-host 10.1.1.4 \
+    --bigip-user admin \
+    --bigip-pass admin \
+    -k --duration 120 --workers 2
+```
+
+#### High concurrency with CSV export
+
+```bash
+python3 tls_load_test.py \
+    --bigip-host 10.1.1.4 \
+    --bigip-user admin \
+    --bigip-pass admin \
+    -k --duration 300 --workers 8 --csv load_results.csv
+```
+
+This creates two files:
+- `load_results_summary.csv` — one row per scenario (throughput, latency, BIG-IP resource stats)
+- `load_results_metrics.csv` — time-series BIG-IP metrics sampled every 5 seconds
+
+#### Using environment variable for password
+
+```bash
+export BIGIP_PASSWORD=admin
+python3 tls_load_test.py \
+    --bigip-host 10.1.1.4 \
+    --bigip-user admin \
+    -k
+```
+
+### Understanding the Load Test Output
+
+The script prints live progress during each scenario, then a comparison report:
+
+```
+================================================================================
+  TLS Load Test — Comparison Report
+================================================================================
+
+  Non-PQC (ECDH only) (10.1.10.20)
+  ------------------------------------------------------------
+  Duration:           300.2s
+  Total handshakes:   18,450
+  Successful:         18,412
+  Failed:             38
+  Throughput:         61.3 handshakes/sec
+  Latency (ms):       min=2.80  avg=3.95  med=3.82  p95=5.20  max=12.40
+  BIG-IP CPU:         avg=12.3%  max=18.5%
+  BIG-IP TMM CPU:     avg=8.7%  max=14.2%
+  BIG-IP Memory:      avg=45.2%  max=45.8%
+
+  PQC (ECDH + ML-KEM hybrid) (10.1.10.30)
+  ------------------------------------------------------------
+  Duration:           300.1s
+  Total handshakes:   17,890
+  Successful:         17,845
+  Failed:             45
+  Throughput:         59.4 handshakes/sec
+  Latency (ms):       min=3.10  avg=4.25  med=4.10  p95=5.65  max=14.20
+  BIG-IP CPU:         avg=14.1%  max=21.3%
+  BIG-IP TMM CPU:     avg=10.5%  max=17.0%
+  BIG-IP Memory:      avg=45.5%  max=46.1%
+
+  ============================================================
+  PQC Impact (relative to Non-PQC (ECDH only))
+  ------------------------------------------------------------
+  Throughput:         -3.1%
+  Avg latency:        +7.6%
+  BIG-IP CPU (avg):   +1.8 percentage points
+  BIG-IP TMM CPU:     +1.8 percentage points
+  BIG-IP Memory:      +0.3 percentage points
+================================================================================
+```
+
+### Key metrics to compare
+
+| Metric | What it tells you |
+|---|---|
+| **Throughput** | How many TLS handshakes/sec the BIG-IP can sustain. A drop indicates PQC overhead. |
+| **Latency avg/p95** | Per-handshake cost under load. Higher = more processing per connection. |
+| **BIG-IP CPU avg/max** | Overall system CPU pressure. Higher = more compute for PQC key exchange math. |
+| **BIG-IP TMM CPU** | Traffic Management Microkernel CPU — the SSL processing engine. Most relevant metric for PQC impact. |
+| **BIG-IP Memory avg/max** | Memory pressure. PQC has larger key sizes (~2KB vs 32B) which may increase memory usage. |
+| **PQC Impact section** | Direct delta showing the cost of enabling PQC on the BIG-IP. |
