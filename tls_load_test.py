@@ -25,6 +25,7 @@ import os
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -156,23 +157,26 @@ def run_single_handshake(target, tls_version, groups, cipher="",
 # ---------------------------------------------------------------------------
 
 def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
-                duration_seconds, insecure, sni, timeout, result_queue):
-    """Worker process: continuously perform TLS handshakes for the given duration."""
+                duration_seconds, insecure, sni, timeout, results_file):
+    """Worker process: continuously perform TLS handshakes for the given duration.
+
+    Results are written to a temporary file (one JSON line per result) to avoid
+    multiprocessing.Queue pipe buffer limits that can cause workers to hang.
+    """
     end_time = time.time() + duration_seconds
-    results = []
-    while time.time() < end_time:
-        result = run_single_handshake(
-            target=target,
-            tls_version=tls_version,
-            groups=groups,
-            cipher=cipher,
-            tls13_cipher=tls13_cipher,
-            timeout=timeout,
-            insecure=insecure,
-            sni=sni,
-        )
-        results.append(result)
-    result_queue.put(results)
+    with open(results_file, "w") as f:
+        while time.time() < end_time:
+            result = run_single_handshake(
+                target=target,
+                tls_version=tls_version,
+                groups=groups,
+                cipher=cipher,
+                tls13_cipher=tls13_cipher,
+                timeout=timeout,
+                insecure=insecure,
+                sni=sni,
+            )
+            f.write(f"{result.timestamp},{result.latency_ms},{result.success}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -350,23 +354,28 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
     )
     metrics_thread.start()
 
-    # Spawn worker processes
-    result_queue = multiprocessing.Queue()
+    # Spawn worker processes — each writes results to a temp file to avoid
+    # multiprocessing.Queue pipe buffer limits that cause hangs.
+    tmp_dir = tempfile.mkdtemp(prefix="tls_load_")
+    result_files = []
     processes = []
     start_time = time.time()
 
-    for _ in range(workers):
+    for i in range(workers):
+        results_file = os.path.join(tmp_dir, f"worker_{i}.csv")
+        result_files.append(results_file)
         p = multiprocessing.Process(
             target=worker_loop,
             args=(scenario.target, scenario.tls_version, scenario.groups,
                   scenario.cipher, scenario.tls13_cipher, duration,
-                  insecure, sni, timeout, result_queue),
+                  insecure, sni, timeout, results_file),
         )
         processes.append(p)
         p.start()
 
     # Progress reporting while workers are running
     print(f"  Load test running...")
+    deadline = start_time + duration + 60  # hard timeout: duration + 60s buffer
     while any(p.is_alive() for p in processes):
         elapsed = time.time() - start_time
         remaining = max(0, duration - elapsed)
@@ -375,11 +384,19 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
         print(f"\r  [{elapsed:>5.0f}s / {duration}s] "
               f"BIG-IP CPU: {latest_cpu}%  TMM: {latest_tmm}%  "
               f"Remaining: {remaining:.0f}s   ", end="", flush=True)
-        time.sleep(5)
+        # Short sleep so we detect worker completion quickly
+        time.sleep(2)
+        # Hard timeout safety
+        if time.time() > deadline:
+            print("\n  WARNING: Workers exceeded deadline, terminating...")
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+            break
 
     # Wait for all workers to finish
     for p in processes:
-        p.join(timeout=30)
+        p.join(timeout=10)
 
     # Stop metrics collection
     stop_event.set()
@@ -388,13 +405,26 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
     elapsed = time.time() - start_time
     print(f"\r  Completed in {elapsed:.1f}s" + " " * 50)
 
-    # Collect results from all workers
+    # Collect results from worker temp files
     all_results = []
-    while not result_queue.empty():
+    for results_file in result_files:
         try:
-            all_results.extend(result_queue.get_nowait())
-        except Exception:
-            break
+            with open(results_file, "r") as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) == 3:
+                        all_results.append(HandshakeResult(
+                            timestamp=float(parts[0]),
+                            latency_ms=float(parts[1]),
+                            success=parts[2] == "True",
+                        ))
+            os.remove(results_file)
+        except (OSError, ValueError):
+            pass
+    try:
+        os.rmdir(tmp_dir)
+    except OSError:
+        pass
 
     return compute_scenario_report(scenario, all_results, metrics_list, elapsed)
 
