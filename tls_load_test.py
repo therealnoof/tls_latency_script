@@ -372,23 +372,28 @@ def run_native_handshake(ctx, target, sni="", timeout=10, payload=None):
 
         latency_ms = (tls_end - tls_start) * 1000.0
 
-        # Send payload for bandwidth stress testing (not timed)
+        # Send payload for bandwidth stress testing (not timed).
+        # Errors here do NOT invalidate the handshake — the TLS handshake
+        # already succeeded. POST failures (nginx 413, broken pipe, etc.)
+        # are expected under heavy load.
         if payload:
-            request_header = (
-                f"POST / HTTP/1.1\r\n"
-                f"Host: {hostname}\r\n"
-                f"Content-Type: application/octet-stream\r\n"
-                f"Content-Length: {len(payload)}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-            ).encode()
-            ssl_sock.sendall(request_header + payload)
-            # Drain response — don't care about contents, just push data
             try:
+                request_header = (
+                    f"POST / HTTP/1.1\r\n"
+                    f"Host: {hostname}\r\n"
+                    f"Content-Type: application/octet-stream\r\n"
+                    f"Content-Length: {len(payload)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                ).encode()
+                ssl_sock.sendall(request_header)
+                ssl_sock.sendall(payload)
+                # Drain response — don't care about contents, just push data
                 while ssl_sock.recv(16384):
                     pass
-            except (socket.timeout, ssl.SSLError):
-                pass
+            except (ssl.SSLError, socket.timeout, socket.error,
+                    BrokenPipeError, ConnectionResetError, OSError):
+                pass  # POST failed but handshake was successful
 
         return HandshakeResult(timestamp=ts, latency_ms=latency_ms, success=True)
 
@@ -545,6 +550,32 @@ def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
 # BIG-IP iControl REST metrics collection
 # ---------------------------------------------------------------------------
 
+def _stat_val(entry, key, default=0):
+    """Extract a stat value from a BIG-IP REST response entry.
+
+    BIG-IP REST API uses two different formats depending on the endpoint:
+      - sys/cpu, sys/memory, sys/tmm-info:  {"key": {"value": 42}}
+      - sys/performance/all-stats:          {"key": {"description": "42"}}
+
+    This helper tries both and returns a numeric value.
+    """
+    item = entry.get(key, {})
+    if isinstance(item, dict):
+        # Try "value" first (sys/cpu, sys/memory, sys/tmm-info)
+        if "value" in item:
+            try:
+                return float(item["value"])
+            except (ValueError, TypeError):
+                return default
+        # Fall back to "description" (sys/performance/all-stats)
+        if "description" in item:
+            try:
+                return float(item["description"])
+            except (ValueError, TypeError):
+                return default
+    return default
+
+
 def _parse_cpu(cpu_data):
     """Extract average CPU utilization from /mgmt/tm/sys/cpu response."""
     try:
@@ -556,8 +587,8 @@ def _parse_cpu(cpu_data):
             for _sub_key, sub_val in nested.items():
                 if isinstance(sub_val, dict) and "nestedStats" in sub_val:
                     cpu_entries = sub_val["nestedStats"].get("entries", {})
-                    one_min_sys = cpu_entries.get("oneMinAvgSystem", {}).get("value", 0)
-                    one_min_user = cpu_entries.get("oneMinAvgUser", {}).get("value", 0)
+                    one_min_sys = _stat_val(cpu_entries, "oneMinAvgSystem")
+                    one_min_user = _stat_val(cpu_entries, "oneMinAvgUser")
                     if one_min_sys or one_min_user:
                         cpu_totals.append(int(one_min_sys) + int(one_min_user))
         return statistics.mean(cpu_totals) if cpu_totals else 0.0
@@ -600,7 +631,17 @@ def _parse_tmm_cpu(tmm_data):
 
 
 def _parse_ssl_stats(perf_data):
-    """Extract SSL and throughput stats from /mgmt/tm/sys/performance/all-stats."""
+    """Extract SSL and throughput stats from /mgmt/tm/sys/performance/all-stats.
+
+    BIG-IP all-stats uses "description" for values (not "value"), and the
+    throughput entry contains "In"/"Out"/"Service" as direct sub-entries
+    rather than "current"/"average"/"max".
+
+    Typical keys:
+      .../SSL%20Transactions       → entries: current (TPS)
+      .../SSL%20Concurrent%20...   → entries: current (connections)
+      .../Throughput(bits)         → entries: In, Out, Service (bits/sec)
+    """
     ssl_conns = 0
     ssl_tps = 0.0
     throughput_in_mbps = 0.0
@@ -611,28 +652,38 @@ def _parse_ssl_stats(perf_data):
             nested = val.get("nestedStats", {}).get("entries", {})
             key_lower = key.lower()
 
-            # SSL metrics
+            # SSL Transactions → TPS
             if "ssl" in key_lower and "transaction" in key_lower:
-                current = nested.get("current", {}).get("value", 0)
-                ssl_tps = float(current)
-            elif "ssl" in key_lower and ("conn" in key_lower or "concurrent" in key_lower):
-                current = nested.get("current", {}).get("value", 0)
-                ssl_conns = int(current)
+                ssl_tps = _stat_val(nested, "current")
 
-            # Throughput metrics (reported in bits/sec by BIG-IP)
-            if "throughput" in key_lower or "bandwidth" in key_lower:
-                current = nested.get("current", {}).get("value", 0)
-                if "in" in key_lower and "out" not in key_lower:
-                    throughput_in_mbps = float(current) / 1_000_000  # bits → Mbps
-                elif "out" in key_lower:
-                    throughput_out_mbps = float(current) / 1_000_000  # bits → Mbps
+            # SSL Concurrent Connections
+            elif "ssl" in key_lower and ("conn" in key_lower
+                                         or "concurrent" in key_lower):
+                ssl_conns = int(_stat_val(nested, "current"))
+
+            # Throughput(bits) → In/Out in bits/sec
+            # The throughput entry has In/Out/Service as direct sub-entries
+            elif "throughput" in key_lower:
+                tp_in = _stat_val(nested, "In")
+                tp_out = _stat_val(nested, "Out")
+                # Also try "current" structure as fallback
+                if tp_in == 0 and tp_out == 0:
+                    tp_in = _stat_val(nested, "current")
+                if tp_in > 0:
+                    throughput_in_mbps = tp_in / 1_000_000  # bits → Mbps
+                if tp_out > 0:
+                    throughput_out_mbps = tp_out / 1_000_000  # bits → Mbps
     except (KeyError, TypeError, ValueError):
         pass
     return ssl_conns, ssl_tps, throughput_in_mbps, throughput_out_mbps
 
 
+_bigip_stats_debug_printed = False
+
+
 def fetch_bigip_stats(session, base_url):
     """Fetch CPU, memory, TMM, and SSL stats from BIG-IP. Returns BigIPMetricSample or None."""
+    global _bigip_stats_debug_printed
     try:
         cpu_resp = session.get(f"{base_url}/sys/cpu", timeout=10)
         cpu_resp.raise_for_status()
@@ -649,6 +700,25 @@ def fetch_bigip_stats(session, base_url):
         perf_resp = session.get(f"{base_url}/sys/performance/all-stats", timeout=10)
         perf_resp.raise_for_status()
         perf_data = perf_resp.json()
+
+        # One-time diagnostic: dump all-stats keys and their sub-entries
+        # so we can verify the parser matches the actual BIG-IP format.
+        if not _bigip_stats_debug_printed:
+            _bigip_stats_debug_printed = True
+            perf_entries = perf_data.get("entries", {})
+            print("\n  [DEBUG] BIG-IP all-stats keys:", file=sys.stderr)
+            for pkey, pval in perf_entries.items():
+                short_key = pkey.rsplit("/", 1)[-1] if "/" in pkey else pkey
+                nested = pval.get("nestedStats", {}).get("entries", {})
+                sub_keys = list(nested.keys())[:6]
+                vals = {}
+                for sk in sub_keys:
+                    item = nested[sk]
+                    if isinstance(item, dict):
+                        v = item.get("value", item.get("description", "?"))
+                        vals[sk] = v
+                print(f"    {short_key}: {vals}", file=sys.stderr)
+            print("", file=sys.stderr)
 
         cpu_pct = _parse_cpu(cpu_data)
         mem_pct = _parse_memory(mem_data)
