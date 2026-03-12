@@ -263,6 +263,19 @@ Install the `requests` library on the test server:
 pip install requests
 ```
 
+### Wrapper Script Setup
+
+The load test requires OpenSSL 3.5 at runtime. Create a wrapper script that sets `LD_LIBRARY_PATH` only for the test process (do **not** add it to `.bashrc` — see README for details):
+
+```bash
+cat > ~/run_test.sh << 'EOF'
+#!/bin/bash
+export LD_LIBRARY_PATH=/usr/local/openssl-3.5/lib64
+exec python3 tls_load_test.py "$@"
+EOF
+chmod +x ~/run_test.sh
+```
+
 ### Running the Load Test
 
 ```bash
@@ -272,7 +285,7 @@ cd /home/ubuntu/tls_latency_script
 #### Standard 5-minute test (default settings)
 
 ```bash
-python3 tls_load_test.py \
+~/run_test.sh \
     --bigip-host 10.1.1.4 \
     --bigip-user admin \
     --bigip-pass admin \
@@ -288,17 +301,31 @@ This runs:
 #### Quick smoke test (2 minutes, fewer workers)
 
 ```bash
-python3 tls_load_test.py \
+~/run_test.sh \
     --bigip-host 10.1.1.4 \
     --bigip-user admin \
     --bigip-pass admin \
     -k --duration 120 --workers 2
 ```
 
-#### High concurrency with CSV export
+#### High concurrency — saturation test
+
+To push the BIG-IP toward CPU saturation, increase workers and batch size. Effective concurrency = workers × batch-size:
 
 ```bash
-python3 tls_load_test.py \
+~/run_test.sh \
+    --bigip-host 10.1.1.4 \
+    --bigip-user admin \
+    --bigip-pass admin \
+    -k --duration 300 --workers 30 --batch-size 50 --engine native
+```
+
+> **Note:** Monitor client CPU with `mpstat -P ALL 1` in a separate session. If the test machine is CPU-saturated (~95%+ across all cores), the results are client-constrained. Use fewer workers/batch or add a second test machine running in parallel against the same VIPs.
+
+#### CSV export
+
+```bash
+~/run_test.sh \
     --bigip-host 10.1.1.4 \
     --bigip-user admin \
     --bigip-pass admin \
@@ -313,7 +340,7 @@ This creates two files:
 
 ```bash
 export BIGIP_PASSWORD=admin
-python3 tls_load_test.py \
+~/run_test.sh \
     --bigip-host 10.1.1.4 \
     --bigip-user admin \
     -k

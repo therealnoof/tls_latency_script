@@ -102,7 +102,26 @@ which curl        # should show /usr/local/bin/curl
 curl --version    # should show curl 8.12.1 ... OpenSSL/3.5.0
 ```
 
-For running the test tools, use the wrapper script (see below) or set `LD_LIBRARY_PATH` inline:
+### 6. Create a wrapper script
+
+To avoid setting `LD_LIBRARY_PATH` manually every time, create a wrapper that sets it only for the test process:
+
+```bash
+cat > ~/run_test.sh << 'EOF'
+#!/bin/bash
+export LD_LIBRARY_PATH=/usr/local/openssl-3.5/lib64
+exec python3 tls_load_test.py "$@"
+EOF
+chmod +x ~/run_test.sh
+```
+
+Then run tests via the wrapper:
+
+```bash
+~/run_test.sh --workers 4 -k --bigip-host 10.1.1.4 --bigip-user admin
+```
+
+For one-off commands without the wrapper, set `LD_LIBRARY_PATH` inline:
 
 ```bash
 LD_LIBRARY_PATH=/usr/local/openssl-3.5/lib64 python3 tls_latency_bench.py -t 10.1.10.20 -k
