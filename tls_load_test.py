@@ -7,22 +7,33 @@ Generates concurrent TLS handshake load via multiprocessing workers, while polli
 BIG-IP CPU, memory, TMM, and SSL stats via iControl REST API. Runs non-PQC and PQC
 scenarios sequentially, then prints a side-by-side comparison report.
 
+Supports two handshake engines:
+  - native: Python ssl module with direct socket control (high throughput, 5-10x faster)
+  - curl:   curl subprocess per handshake (legacy, lower throughput)
+
 Requirements:
   - Python 3.10+
-  - curl built with OpenSSL 3.2+ (3.5+ for ML-KEM PQC ciphers)
+  - For native engine: Python linked against OpenSSL 3.2+ (3.5+ for ML-KEM PQC)
+  - For curl engine:   curl built with OpenSSL 3.2+ (3.5+ for ML-KEM PQC ciphers)
   - requests library: pip install requests
   - Network access to BIG-IP management interface and VIPs
 
 Usage:
   python3 tls_load_test.py --bigip-host 10.1.1.4 --bigip-user admin --bigip-pass admin -k
-  python3 tls_load_test.py --duration 120 --workers 8 --csv results.csv
+  python3 tls_load_test.py --engine native --workers 16 --duration 120 --csv results.csv
+  python3 tls_load_test.py --engine curl --workers 4 -k   # legacy curl mode
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import multiprocessing
 import os
+import socket
+import ssl
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -153,30 +164,217 @@ def run_single_handshake(target, tls_version, groups, cipher="",
 
 
 # ---------------------------------------------------------------------------
+# Native SSL engine — bypasses curl subprocess for higher throughput
+# ---------------------------------------------------------------------------
+
+def _get_openssl_version_tuple():
+    """Parse the OpenSSL version from ssl.OPENSSL_VERSION into (major, minor, patch)."""
+    try:
+        parts = ssl.OPENSSL_VERSION.split()
+        if len(parts) >= 2:
+            nums = parts[1].split(".")
+            return (int(nums[0]), int(nums[1]), int(nums[2]) if len(nums) > 2 else 0)
+    except (IndexError, ValueError):
+        pass
+    return (0, 0, 0)
+
+
+def _try_set_groups_ctypes(ctx, groups_str):
+    """Attempt to set key exchange groups via ctypes calling SSL_CTX_set1_groups_list.
+
+    This is a fallback for Python versions where set_ecdh_curve() does not call
+    the modern groups API. Only attempted when Python's ssl module is linked
+    against OpenSSL (not LibreSSL) version 3.2+.
+
+    Returns True on success, False on failure.
+    """
+    # Only safe when Python's ssl is linked against OpenSSL (not LibreSSL)
+    if "LibreSSL" in ssl.OPENSSL_VERSION:
+        return False
+    major, minor, _ = _get_openssl_version_tuple()
+    if major < 3 or (major == 3 and minor < 2):
+        return False
+
+    try:
+        # Find the libssl that Python is already linked against
+        libssl_name = ctypes.util.find_library("ssl")
+        if not libssl_name:
+            return False
+        libssl = ctypes.CDLL(libssl_name)
+
+        # SSL_CTX_set1_groups_list(SSL_CTX *ctx, const char *str) → int
+        func = libssl.SSL_CTX_set1_groups_list
+        func.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        func.restype = ctypes.c_int
+
+        # Extract the SSL_CTX* pointer from the Python SSLContext object.
+        # In CPython, PySSLContext has: PyObject_HEAD (2 pointers) then SSL_CTX*.
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+        offset = 2 * ptr_size  # skip ob_refcnt + ob_type
+        ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + offset).value
+
+        result = func(ssl_ctx_ptr, groups_str.encode("ascii"))
+        return result == 1
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False
+
+
+def _create_ssl_context(tls_version, groups, cipher="", tls13_cipher="",
+                        insecure=False):
+    """Create a reusable SSLContext configured for the requested TLS parameters.
+
+    Raises RuntimeError if the requested key exchange groups are not supported.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    # Certificate verification
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx.load_default_certs()
+
+    # Pin TLS version
+    if tls_version == "1.2":
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    else:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+
+    # Set cipher suites (TLS 1.2)
+    if cipher:
+        ctx.set_ciphers(cipher)
+
+    # Set key exchange groups
+    if groups:
+        try:
+            # Python 3.10+ with OpenSSL 3.x: set_ecdh_curve calls
+            # SSL_CTX_set1_groups_list internally, supporting PQC names
+            ctx.set_ecdh_curve(groups)
+        except (ValueError, ssl.SSLError):
+            # Fallback: use ctypes to call SSL_CTX_set1_groups_list directly
+            if not _try_set_groups_ctypes(ctx, groups):
+                raise RuntimeError(
+                    f"Cannot set key exchange group '{groups}'. "
+                    f"Python ssl is linked against {ssl.OPENSSL_VERSION}. "
+                    f"PQC groups require OpenSSL 3.2+ (3.5+ for ML-KEM). "
+                    f"Use --engine curl as a fallback."
+                )
+
+    return ctx
+
+
+def run_native_handshake(ctx, target, sni="", timeout=10):
+    """Execute one TLS handshake using Python's ssl module. Returns HandshakeResult.
+
+    The SSLContext is pre-built and reused across calls — only the socket
+    connect + TLS handshake are performed per invocation, which eliminates
+    the subprocess overhead of curl.
+    """
+    hostname = sni if sni else target
+    ts = time.time()
+    sock = None
+    ssl_sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+
+        # SO_LINGER with timeout=0: sends RST on close instead of FIN, which
+        # avoids TIME_WAIT state. Critical at high throughput to prevent
+        # ephemeral port exhaustion (28k ports / 60s TIME_WAIT = max ~470/sec
+        # without this).
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                        struct.pack("ii", 1, 0))
+
+        # TCP connect (not timed — we only measure the TLS handshake)
+        sock.connect((target, 443))
+
+        # Wrap socket and perform TLS handshake (TIMED)
+        ssl_sock = ctx.wrap_socket(sock, server_hostname=hostname,
+                                   do_handshake_on_connect=False)
+        tls_start = time.perf_counter()
+        ssl_sock.do_handshake()
+        tls_end = time.perf_counter()
+
+        latency_ms = (tls_end - tls_start) * 1000.0
+        return HandshakeResult(timestamp=ts, latency_ms=latency_ms, success=True)
+
+    except (ssl.SSLError, socket.timeout, socket.error,
+            ConnectionRefusedError, OSError):
+        return HandshakeResult(timestamp=ts, latency_ms=0, success=False)
+    finally:
+        # Close whichever socket layer exists; ssl_sock.close() closes
+        # the underlying sock too.
+        to_close = ssl_sock if ssl_sock else sock
+        if to_close:
+            try:
+                to_close.close()
+            except OSError:
+                pass
+
+
+def probe_native_support(groups_list):
+    """Test whether the native SSL engine supports the requested key exchange groups.
+
+    Args:
+        groups_list: list of group strings to test (e.g. ["X25519", "X25519MLKEM768"])
+
+    Returns:
+        (supported: bool, details: str) — True if ALL groups are supported natively.
+    """
+    unsupported = []
+    for groups_str in groups_list:
+        try:
+            _create_ssl_context(tls_version="1.3", groups=groups_str, insecure=True)
+        except (RuntimeError, ssl.SSLError, Exception):
+            unsupported.append(groups_str)
+
+    if not unsupported:
+        return True, "All requested groups supported natively"
+    return False, f"Unsupported groups: {', '.join(unsupported)}"
+
+
+# ---------------------------------------------------------------------------
 # Multiprocessing worker
 # ---------------------------------------------------------------------------
 
 def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
-                duration_seconds, insecure, sni, timeout, results_file):
+                duration_seconds, insecure, sni, timeout, results_file,
+                engine="native"):
     """Worker process: continuously perform TLS handshakes for the given duration.
 
-    Results are written to a temporary file (one JSON line per result) to avoid
+    Results are written to a temporary file (one CSV line per result) to avoid
     multiprocessing.Queue pipe buffer limits that can cause workers to hang.
+
+    When engine='native', creates a single SSLContext upfront and reuses it for
+    all handshakes — eliminating curl subprocess overhead entirely.
     """
     end_time = time.time() + duration_seconds
-    with open(results_file, "w") as f:
-        while time.time() < end_time:
-            result = run_single_handshake(
-                target=target,
-                tls_version=tls_version,
-                groups=groups,
-                cipher=cipher,
-                tls13_cipher=tls13_cipher,
-                timeout=timeout,
-                insecure=insecure,
-                sni=sni,
-            )
-            f.write(f"{result.timestamp},{result.latency_ms},{result.success}\n")
+
+    if engine == "native":
+        # Build SSLContext once for this worker — reused for every handshake
+        ctx = _create_ssl_context(
+            tls_version=tls_version, groups=groups,
+            cipher=cipher, tls13_cipher=tls13_cipher,
+            insecure=insecure,
+        )
+        with open(results_file, "w") as f:
+            while time.time() < end_time:
+                result = run_native_handshake(
+                    ctx=ctx, target=target, sni=sni, timeout=timeout,
+                )
+                f.write(f"{result.timestamp},{result.latency_ms},{result.success}\n")
+    else:
+        # Legacy curl subprocess engine
+        with open(results_file, "w") as f:
+            while time.time() < end_time:
+                result = run_single_handshake(
+                    target=target, tls_version=tls_version, groups=groups,
+                    cipher=cipher, tls13_cipher=tls13_cipher,
+                    timeout=timeout, insecure=insecure, sni=sni,
+                )
+                f.write(f"{result.timestamp},{result.latency_ms},{result.success}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -319,13 +517,14 @@ def collect_bigip_metrics(bigip_host, username, password, poll_interval,
 # ---------------------------------------------------------------------------
 
 def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
-                      bigip_host, bigip_user, bigip_pass, poll_interval):
+                      bigip_host, bigip_user, bigip_pass, poll_interval,
+                      engine="native"):
     """Run a complete load test scenario: spawn workers + collect BIG-IP metrics."""
     w = 80
     print(f"\n{'=' * w}")
     print(f"  Scenario: {scenario.label}")
     print(f"  Target: {scenario.target} | Groups: {scenario.groups}")
-    print(f"  Workers: {workers} | Duration: {duration}s")
+    print(f"  Workers: {workers} | Duration: {duration}s | Engine: {engine}")
     print(f"{'=' * w}")
 
     # Verify the VIP is reachable with a quick handshake
@@ -368,7 +567,7 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
             target=worker_loop,
             args=(scenario.target, scenario.tls_version, scenario.groups,
                   scenario.cipher, scenario.tls13_cipher, duration,
-                  insecure, sni, timeout, results_file),
+                  insecure, sni, timeout, results_file, engine),
         )
         processes.append(p)
         p.start()
@@ -590,19 +789,26 @@ def export_csv(reports, path):
 # Prerequisites
 # ---------------------------------------------------------------------------
 
-def check_prerequisites():
-    """Print curl and OpenSSL versions."""
-    try:
-        r = subprocess.run(["curl", "--version"], capture_output=True, text=True)
-        first_line = r.stdout.splitlines()[0] if r.stdout else "curl: unknown"
-        print(f"  {first_line}")
-    except FileNotFoundError:
-        print("ERROR: curl not found.", file=sys.stderr)
-        sys.exit(1)
+def check_prerequisites(engine):
+    """Print curl, OpenSSL, and Python SSL versions."""
+    # Python ssl module info (always relevant)
+    print(f"  Python {sys.version.split()[0]} ssl: {ssl.OPENSSL_VERSION}")
+    has_tls13 = getattr(ssl, "HAS_TLSv1_3", False)
+    print(f"  TLS 1.3 support: {'yes' if has_tls13 else 'no'}")
+
+    if engine == "curl":
+        try:
+            r = subprocess.run(["curl", "--version"], capture_output=True, text=True)
+            first_line = r.stdout.splitlines()[0] if r.stdout else "curl: unknown"
+            print(f"  {first_line}")
+        except FileNotFoundError:
+            print("ERROR: curl not found (required for --engine curl).",
+                  file=sys.stderr)
+            sys.exit(1)
 
     try:
         r = subprocess.run(["openssl", "version"], capture_output=True, text=True)
-        print(f"  {r.stdout.strip()}")
+        print(f"  System OpenSSL: {r.stdout.strip()}")
     except FileNotFoundError:
         print("  openssl CLI not found (optional)")
 
@@ -641,7 +847,8 @@ def main():
         epilog=(
             "examples:\n"
             "  %(prog)s --bigip-host 10.1.1.4 --bigip-user admin --bigip-pass admin -k\n"
-            "  %(prog)s --duration 120 --workers 8 --csv results.csv\n"
+            "  %(prog)s --engine native --workers 16 --duration 120 --csv results.csv\n"
+            "  %(prog)s --engine curl --workers 4 -k   # legacy curl mode\n"
             "  %(prog)s --non-pqc-vip 10.1.10.20 --pqc-vip 10.1.10.30 -k\n"
         ),
     )
@@ -684,6 +891,12 @@ def main():
     parser.add_argument("--csv", metavar="FILE",
                         help="export results to CSV (creates _summary.csv and _metrics.csv)")
 
+    # Engine selection
+    parser.add_argument("--engine", choices=["auto", "native", "curl"], default="auto",
+                        help="handshake engine: native (fast, Python ssl), "
+                             "curl (subprocess), auto (try native, fall back to curl). "
+                             "Default: auto")
+
     args = parser.parse_args()
 
     # Resolve BIG-IP password: CLI arg > env var > error
@@ -693,14 +906,40 @@ def main():
     if not bigip_pass:
         parser.error("BIG-IP password required: use --bigip-pass or set BIGIP_PASSWORD env var")
 
+    # Resolve engine: auto → probe native support, pick best option
+    engine = args.engine
+    if engine == "auto":
+        test_groups = list({args.non_pqc_groups, args.pqc_groups})
+        supported, details = probe_native_support(test_groups)
+        if supported:
+            engine = "native"
+            print(f"Engine: auto → native ({details})")
+        else:
+            engine = "curl"
+            print(f"Engine: auto → curl ({details})")
+    else:
+        print(f"Engine: {engine}")
+
+    # If native was explicitly requested, verify groups are supported
+    if args.engine == "native":
+        test_groups = list({args.non_pqc_groups, args.pqc_groups})
+        supported, details = probe_native_support(test_groups)
+        if not supported:
+            print(f"ERROR: {details}", file=sys.stderr)
+            print(f"  Python ssl is linked against: {ssl.OPENSSL_VERSION}",
+                  file=sys.stderr)
+            print("  Use --engine curl or build Python against OpenSSL 3.5+.",
+                  file=sys.stderr)
+            sys.exit(1)
+
     # Banner
-    print("TLS Load Test — Non-PQC vs PQC Comparison")
+    print(f"\nTLS Load Test — Non-PQC vs PQC Comparison")
     print(f"Duration: {args.duration}s per scenario | Workers: {args.workers} "
-          f"| Poll interval: {args.poll_interval}s")
+          f"| Engine: {engine} | Poll interval: {args.poll_interval}s")
     print(f"Non-PQC VIP: {args.non_pqc_vip} ({args.non_pqc_groups})")
     print(f"PQC VIP:     {args.pqc_vip} ({args.pqc_groups})")
     print()
-    check_prerequisites()
+    check_prerequisites(engine)
     verify_bigip_connection(args.bigip_host, args.bigip_user, bigip_pass)
 
     # Define scenarios
@@ -733,6 +972,7 @@ def main():
             bigip_user=args.bigip_user,
             bigip_pass=bigip_pass,
             poll_interval=args.poll_interval,
+            engine=engine,
         )
         if report:
             reports.append(report)
