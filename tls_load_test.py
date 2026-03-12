@@ -80,6 +80,8 @@ class BigIPMetricSample:
     tmm_cpu_pct: float
     active_ssl_connections: int
     ssl_transactions_per_sec: float
+    throughput_in_mbps: float = 0.0
+    throughput_out_mbps: float = 0.0
 
 
 @dataclass
@@ -103,6 +105,12 @@ class ScenarioReport:
     bigip_mem_max: float = 0.0
     bigip_tmm_cpu_avg: float = 0.0
     bigip_tmm_cpu_max: float = 0.0
+    bigip_ssl_tps_avg: float = 0.0
+    bigip_ssl_tps_max: float = 0.0
+    bigip_throughput_in_avg_mbps: float = 0.0
+    bigip_throughput_in_max_mbps: float = 0.0
+    bigip_throughput_out_avg_mbps: float = 0.0
+    bigip_throughput_out_max_mbps: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -421,9 +429,33 @@ def probe_native_support(groups_list):
 # Multiprocessing worker
 # ---------------------------------------------------------------------------
 
+def _run_batch_handshake(ctx, target, sni, timeout, batch_size):
+    """Run a batch of concurrent native handshakes using threads within a worker.
+
+    Each handshake gets its own thread and socket. The SSLContext is shared
+    (thread-safe in OpenSSL 3.x). Returns a list of HandshakeResults.
+    """
+    results = []
+    lock = threading.Lock()
+
+    def _do_one():
+        r = run_native_handshake(ctx=ctx, target=target, sni=sni, timeout=timeout)
+        with lock:
+            results.append(r)
+
+    threads = []
+    for _ in range(batch_size):
+        t = threading.Thread(target=_do_one)
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout + 5)
+    return results
+
+
 def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
                 duration_seconds, insecure, sni, timeout, results_file,
-                engine="native"):
+                engine="native", batch_size=1):
     """Worker process: continuously perform TLS handshakes for the given duration.
 
     Results are written to a temporary file (one CSV line per result) to avoid
@@ -431,6 +463,9 @@ def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
 
     When engine='native', creates a single SSLContext upfront and reuses it for
     all handshakes — eliminating curl subprocess overhead entirely.
+
+    When batch_size > 1 (native only), each iteration fires batch_size concurrent
+    handshakes using threads, multiplying throughput per worker.
     """
     end_time = time.time() + duration_seconds
 
@@ -441,14 +476,27 @@ def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
             cipher=cipher, tls13_cipher=tls13_cipher,
             insecure=insecure,
         )
-        with open(results_file, "w") as f:
-            while time.time() < end_time:
-                result = run_native_handshake(
-                    ctx=ctx, target=target, sni=sni, timeout=timeout,
-                )
-                f.write(f"{result.timestamp},{result.latency_ms},{result.success}\n")
+        if batch_size > 1:
+            # Threaded batch mode: fire batch_size concurrent handshakes per iteration
+            with open(results_file, "w") as f:
+                while time.time() < end_time:
+                    batch_results = _run_batch_handshake(
+                        ctx, target, sni, timeout, batch_size,
+                    )
+                    for result in batch_results:
+                        f.write(f"{result.timestamp},{result.latency_ms},"
+                                f"{result.success}\n")
+        else:
+            # Sequential mode (batch_size=1)
+            with open(results_file, "w") as f:
+                while time.time() < end_time:
+                    result = run_native_handshake(
+                        ctx=ctx, target=target, sni=sni, timeout=timeout,
+                    )
+                    f.write(f"{result.timestamp},{result.latency_ms},"
+                            f"{result.success}\n")
     else:
-        # Legacy curl subprocess engine
+        # Legacy curl subprocess engine (no batching)
         with open(results_file, "w") as f:
             while time.time() < end_time:
                 result = run_single_handshake(
@@ -456,7 +504,8 @@ def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
                     cipher=cipher, tls13_cipher=tls13_cipher,
                     timeout=timeout, insecure=insecure, sni=sni,
                 )
-                f.write(f"{result.timestamp},{result.latency_ms},{result.success}\n")
+                f.write(f"{result.timestamp},{result.latency_ms},"
+                        f"{result.success}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -518,28 +567,35 @@ def _parse_tmm_cpu(tmm_data):
 
 
 def _parse_ssl_stats(perf_data):
-    """Extract SSL connection count and TPS from /mgmt/tm/sys/performance/all-stats."""
+    """Extract SSL and throughput stats from /mgmt/tm/sys/performance/all-stats."""
     ssl_conns = 0
     ssl_tps = 0.0
+    throughput_in_mbps = 0.0
+    throughput_out_mbps = 0.0
     try:
         entries = perf_data.get("entries", {})
         for key, val in entries.items():
             nested = val.get("nestedStats", {}).get("entries", {})
-            desc = nested.get("description", {})
-            if isinstance(desc, dict):
-                desc = desc.get("description", "")
-
-            # Look for SSL-related performance counters
             key_lower = key.lower()
+
+            # SSL metrics
             if "ssl" in key_lower and "transaction" in key_lower:
                 current = nested.get("current", {}).get("value", 0)
                 ssl_tps = float(current)
             elif "ssl" in key_lower and ("conn" in key_lower or "concurrent" in key_lower):
                 current = nested.get("current", {}).get("value", 0)
                 ssl_conns = int(current)
+
+            # Throughput metrics (reported in bits/sec by BIG-IP)
+            if "throughput" in key_lower or "bandwidth" in key_lower:
+                current = nested.get("current", {}).get("value", 0)
+                if "in" in key_lower and "out" not in key_lower:
+                    throughput_in_mbps = float(current) / 1_000_000  # bits → Mbps
+                elif "out" in key_lower:
+                    throughput_out_mbps = float(current) / 1_000_000  # bits → Mbps
     except (KeyError, TypeError, ValueError):
         pass
-    return ssl_conns, ssl_tps
+    return ssl_conns, ssl_tps, throughput_in_mbps, throughput_out_mbps
 
 
 def fetch_bigip_stats(session, base_url):
@@ -564,7 +620,7 @@ def fetch_bigip_stats(session, base_url):
         cpu_pct = _parse_cpu(cpu_data)
         mem_pct = _parse_memory(mem_data)
         tmm_cpu = _parse_tmm_cpu(tmm_data)
-        ssl_conns, ssl_tps = _parse_ssl_stats(perf_data)
+        ssl_conns, ssl_tps, tp_in, tp_out = _parse_ssl_stats(perf_data)
 
         return BigIPMetricSample(
             timestamp=time.time(),
@@ -573,6 +629,8 @@ def fetch_bigip_stats(session, base_url):
             tmm_cpu_pct=tmm_cpu,
             active_ssl_connections=ssl_conns,
             ssl_transactions_per_sec=ssl_tps,
+            throughput_in_mbps=tp_in,
+            throughput_out_mbps=tp_out,
         )
     except requests.RequestException as e:
         print(f"  WARNING: BIG-IP metric poll failed: {e}", file=sys.stderr)
@@ -600,13 +658,16 @@ def collect_bigip_metrics(bigip_host, username, password, poll_interval,
 
 def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
                       bigip_host, bigip_user, bigip_pass, poll_interval,
-                      engine="native"):
+                      engine="native", batch_size=1):
     """Run a complete load test scenario: spawn workers + collect BIG-IP metrics."""
+    effective_conns = workers * batch_size
     w = 80
     print(f"\n{'=' * w}")
     print(f"  Scenario: {scenario.label}")
     print(f"  Target: {scenario.target} | Groups: {scenario.groups}")
-    print(f"  Workers: {workers} | Duration: {duration}s | Engine: {engine}")
+    print(f"  Workers: {workers} | Batch: {batch_size} | "
+          f"Effective concurrency: {effective_conns} | Engine: {engine}")
+    print(f"  Duration: {duration}s")
     print(f"{'=' * w}")
 
     # Verify the VIP is reachable with a quick handshake
@@ -649,7 +710,8 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
             target=worker_loop,
             args=(scenario.target, scenario.tls_version, scenario.groups,
                   scenario.cipher, scenario.tls13_cipher, duration,
-                  insecure, sni, timeout, results_file, engine),
+                  insecure, sni, timeout, results_file, engine,
+                  batch_size),
         )
         processes.append(p)
         p.start()
@@ -660,10 +722,16 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
     while any(p.is_alive() for p in processes):
         elapsed = time.time() - start_time
         remaining = max(0, duration - elapsed)
-        latest_cpu = f"{metrics_list[-1].cpu_utilization:.1f}" if metrics_list else "N/A"
-        latest_tmm = f"{metrics_list[-1].tmm_cpu_pct:.1f}" if metrics_list else "N/A"
+        if metrics_list:
+            m = metrics_list[-1]
+            latest_tmm = f"{m.tmm_cpu_pct:.0f}"
+            latest_tps = f"{m.ssl_transactions_per_sec:.0f}"
+            latest_tp = f"{m.throughput_in_mbps + m.throughput_out_mbps:.0f}"
+        else:
+            latest_tmm = latest_tps = latest_tp = "N/A"
         print(f"\r  [{elapsed:>5.0f}s / {duration}s] "
-              f"BIG-IP CPU: {latest_cpu}%  TMM: {latest_tmm}%  "
+              f"TMM: {latest_tmm}%  SSL TPS: {latest_tps}  "
+              f"Throughput: {latest_tp} Mbps  "
               f"Remaining: {remaining:.0f}s   ", end="", flush=True)
         # Short sleep so we detect worker completion quickly
         time.sleep(2)
@@ -730,6 +798,9 @@ def compute_scenario_report(scenario, results, metrics, elapsed):
     cpu_vals = [m.cpu_utilization for m in metrics]
     mem_vals = [m.memory_used_pct for m in metrics]
     tmm_vals = [m.tmm_cpu_pct for m in metrics]
+    ssl_tps_vals = [m.ssl_transactions_per_sec for m in metrics]
+    tp_in_vals = [m.throughput_in_mbps for m in metrics]
+    tp_out_vals = [m.throughput_out_mbps for m in metrics]
 
     return ScenarioReport(
         scenario=scenario,
@@ -751,6 +822,12 @@ def compute_scenario_report(scenario, results, metrics, elapsed):
         bigip_mem_max=max(mem_vals) if mem_vals else 0.0,
         bigip_tmm_cpu_avg=statistics.mean(tmm_vals) if tmm_vals else 0.0,
         bigip_tmm_cpu_max=max(tmm_vals) if tmm_vals else 0.0,
+        bigip_ssl_tps_avg=statistics.mean(ssl_tps_vals) if ssl_tps_vals else 0.0,
+        bigip_ssl_tps_max=max(ssl_tps_vals) if ssl_tps_vals else 0.0,
+        bigip_throughput_in_avg_mbps=statistics.mean(tp_in_vals) if tp_in_vals else 0.0,
+        bigip_throughput_in_max_mbps=max(tp_in_vals) if tp_in_vals else 0.0,
+        bigip_throughput_out_avg_mbps=statistics.mean(tp_out_vals) if tp_out_vals else 0.0,
+        bigip_throughput_out_max_mbps=max(tp_out_vals) if tp_out_vals else 0.0,
     )
 
 
@@ -766,6 +843,11 @@ def print_comparison_report(reports):
     print(f"{'=' * w}")
 
     for report in reports:
+        tp_in = report.bigip_throughput_in_avg_mbps
+        tp_out = report.bigip_throughput_out_avg_mbps
+        tp_in_max = report.bigip_throughput_in_max_mbps
+        tp_out_max = report.bigip_throughput_out_max_mbps
+
         print(f"\n  {report.scenario.label} ({report.scenario.target})")
         print(f"  {'-' * 60}")
         print(f"  Duration:           {report.duration_seconds:.1f}s")
@@ -784,6 +866,10 @@ def print_comparison_report(reports):
               f"max={report.bigip_tmm_cpu_max:.1f}%")
         print(f"  BIG-IP Memory:      avg={report.bigip_mem_avg:.1f}%  "
               f"max={report.bigip_mem_max:.1f}%")
+        print(f"  BIG-IP SSL TPS:     avg={report.bigip_ssl_tps_avg:.0f}  "
+              f"max={report.bigip_ssl_tps_max:.0f}")
+        print(f"  BIG-IP Throughput:  in={tp_in:.1f} Mbps (max {tp_in_max:.1f})  "
+              f"out={tp_out:.1f} Mbps (max {tp_out_max:.1f})")
 
     # Delta comparison
     if len(reports) == 2:
@@ -811,6 +897,18 @@ def print_comparison_report(reports):
         mem_delta = pqc.bigip_mem_avg - base.bigip_mem_avg
         print(f"  BIG-IP Memory:      {mem_delta:+.1f} percentage points")
 
+        if base.bigip_ssl_tps_avg > 0:
+            tps_delta = ((pqc.bigip_ssl_tps_avg - base.bigip_ssl_tps_avg)
+                         / base.bigip_ssl_tps_avg * 100)
+            print(f"  SSL TPS:            {tps_delta:+.1f}%")
+
+        base_tp = base.bigip_throughput_in_avg_mbps + base.bigip_throughput_out_avg_mbps
+        pqc_tp = pqc.bigip_throughput_in_avg_mbps + pqc.bigip_throughput_out_avg_mbps
+        if base_tp > 0:
+            tp_delta = ((pqc_tp - base_tp) / base_tp * 100)
+            print(f"  Throughput:         {tp_delta:+.1f}% "
+                  f"({base_tp:.1f} → {pqc_tp:.1f} Mbps)")
+
     print(f"\n{'=' * w}")
 
 
@@ -830,7 +928,10 @@ def export_csv(reports, path):
             "failed,handshakes_per_sec,"
             "lat_min_ms,lat_avg_ms,lat_median_ms,lat_p95_ms,lat_max_ms,lat_stddev_ms,"
             "bigip_cpu_avg,bigip_cpu_max,bigip_mem_avg,bigip_mem_max,"
-            "bigip_tmm_cpu_avg,bigip_tmm_cpu_max\n"
+            "bigip_tmm_cpu_avg,bigip_tmm_cpu_max,"
+            "bigip_ssl_tps_avg,bigip_ssl_tps_max,"
+            "bigip_throughput_in_avg_mbps,bigip_throughput_in_max_mbps,"
+            "bigip_throughput_out_avg_mbps,bigip_throughput_out_max_mbps\n"
         )
         for r in reports:
             f.write(
@@ -843,7 +944,10 @@ def export_csv(reports, path):
                 f'{r.latency_max_ms:.2f},{r.latency_stddev_ms:.2f},'
                 f'{r.bigip_cpu_avg:.1f},{r.bigip_cpu_max:.1f},'
                 f'{r.bigip_mem_avg:.1f},{r.bigip_mem_max:.1f},'
-                f'{r.bigip_tmm_cpu_avg:.1f},{r.bigip_tmm_cpu_max:.1f}\n'
+                f'{r.bigip_tmm_cpu_avg:.1f},{r.bigip_tmm_cpu_max:.1f},'
+                f'{r.bigip_ssl_tps_avg:.0f},{r.bigip_ssl_tps_max:.0f},'
+                f'{r.bigip_throughput_in_avg_mbps:.1f},{r.bigip_throughput_in_max_mbps:.1f},'
+                f'{r.bigip_throughput_out_avg_mbps:.1f},{r.bigip_throughput_out_max_mbps:.1f}\n'
             )
     print(f"  Summary:     {summary_path}")
 
@@ -852,7 +956,8 @@ def export_csv(reports, path):
     with open(metrics_path, "w") as f:
         f.write(
             "scenario,timestamp,elapsed_s,cpu_pct,memory_pct,"
-            "tmm_cpu_pct,active_ssl_conns,ssl_tps\n"
+            "tmm_cpu_pct,active_ssl_conns,ssl_tps,"
+            "throughput_in_mbps,throughput_out_mbps\n"
         )
         for r in reports:
             start_ts = r.bigip_metrics[0].timestamp if r.bigip_metrics else 0
@@ -862,7 +967,8 @@ def export_csv(reports, path):
                     f'"{r.scenario.label}",{m.timestamp:.3f},{elapsed:.1f},'
                     f'{m.cpu_utilization:.1f},{m.memory_used_pct:.1f},'
                     f'{m.tmm_cpu_pct:.1f},{m.active_ssl_connections},'
-                    f'{m.ssl_transactions_per_sec:.1f}\n'
+                    f'{m.ssl_transactions_per_sec:.1f},'
+                    f'{m.throughput_in_mbps:.1f},{m.throughput_out_mbps:.1f}\n'
                 )
     print(f"  Time-series: {metrics_path}")
 
@@ -978,6 +1084,10 @@ def main():
                         help="handshake engine: native (fast, Python ssl), "
                              "curl (subprocess), auto (try native, fall back to curl). "
                              "Default: auto")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="concurrent connections per worker (threaded). "
+                             "Effective concurrency = workers × batch-size. "
+                             "Native engine only. (default: 1)")
 
     args = parser.parse_args()
 
@@ -1014,10 +1124,20 @@ def main():
                   file=sys.stderr)
             sys.exit(1)
 
+    # Resolve batch size
+    batch_size = args.batch_size
+    if batch_size < 1:
+        batch_size = 1
+    if engine == "curl" and batch_size > 1:
+        print("WARNING: --batch-size > 1 only works with native engine, ignoring.")
+        batch_size = 1
+    effective_conns = args.workers * batch_size
+
     # Banner
     print(f"\nTLS Load Test — Non-PQC vs PQC Comparison")
-    print(f"Duration: {args.duration}s per scenario | Workers: {args.workers} "
-          f"| Engine: {engine} | Poll interval: {args.poll_interval}s")
+    batch_info = f" × {batch_size} batch" if batch_size > 1 else ""
+    print(f"Duration: {args.duration}s per scenario | Workers: {args.workers}"
+          f"{batch_info} | Concurrency: {effective_conns} | Engine: {engine}")
     print(f"Non-PQC VIP: {args.non_pqc_vip} ({args.non_pqc_groups})")
     print(f"PQC VIP:     {args.pqc_vip} ({args.pqc_groups})")
     print()
@@ -1055,6 +1175,7 @@ def main():
             bigip_pass=bigip_pass,
             poll_interval=args.poll_interval,
             engine=engine,
+            batch_size=batch_size,
         )
         if report:
             reports.append(report)
