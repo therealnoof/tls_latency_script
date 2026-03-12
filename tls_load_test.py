@@ -334,12 +334,16 @@ def _create_ssl_context(tls_version, groups, cipher="", tls13_cipher="",
     return ctx
 
 
-def run_native_handshake(ctx, target, sni="", timeout=10):
+def run_native_handshake(ctx, target, sni="", timeout=10, payload=None):
     """Execute one TLS handshake using Python's ssl module. Returns HandshakeResult.
 
     The SSLContext is pre-built and reused across calls — only the socket
     connect + TLS handshake are performed per invocation, which eliminates
     the subprocess overhead of curl.
+
+    When payload is provided (a bytes buffer), an HTTP POST is sent after the
+    handshake to push data through the BIG-IP for bandwidth stress testing.
+    Latency only measures the TLS handshake, not the data transfer.
     """
     hostname = sni if sni else target
     ts = time.time()
@@ -367,6 +371,25 @@ def run_native_handshake(ctx, target, sni="", timeout=10):
         tls_end = time.perf_counter()
 
         latency_ms = (tls_end - tls_start) * 1000.0
+
+        # Send payload for bandwidth stress testing (not timed)
+        if payload:
+            request_header = (
+                f"POST / HTTP/1.1\r\n"
+                f"Host: {hostname}\r\n"
+                f"Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode()
+            ssl_sock.sendall(request_header + payload)
+            # Drain response — don't care about contents, just push data
+            try:
+                while ssl_sock.recv(16384):
+                    pass
+            except (socket.timeout, ssl.SSLError):
+                pass
+
         return HandshakeResult(timestamp=ts, latency_ms=latency_ms, success=True)
 
     except (ssl.SSLError, socket.timeout, socket.error,
@@ -429,7 +452,7 @@ def probe_native_support(groups_list):
 # Multiprocessing worker
 # ---------------------------------------------------------------------------
 
-def _run_batch_handshake(ctx, target, sni, timeout, batch_size):
+def _run_batch_handshake(ctx, target, sni, timeout, batch_size, payload=None):
     """Run a batch of concurrent native handshakes using threads within a worker.
 
     Each handshake gets its own thread and socket. The SSLContext is shared
@@ -439,7 +462,8 @@ def _run_batch_handshake(ctx, target, sni, timeout, batch_size):
     lock = threading.Lock()
 
     def _do_one():
-        r = run_native_handshake(ctx=ctx, target=target, sni=sni, timeout=timeout)
+        r = run_native_handshake(ctx=ctx, target=target, sni=sni,
+                                 timeout=timeout, payload=payload)
         with lock:
             results.append(r)
 
@@ -455,7 +479,7 @@ def _run_batch_handshake(ctx, target, sni, timeout, batch_size):
 
 def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
                 duration_seconds, insecure, sni, timeout, results_file,
-                engine="native", batch_size=1):
+                engine="native", batch_size=1, payload_kb=0):
     """Worker process: continuously perform TLS handshakes for the given duration.
 
     Results are written to a temporary file (one CSV line per result) to avoid
@@ -466,8 +490,15 @@ def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
 
     When batch_size > 1 (native only), each iteration fires batch_size concurrent
     handshakes using threads, multiplying throughput per worker.
+
+    When payload_kb > 0, each connection sends an HTTP POST body of that size
+    after the TLS handshake to stress bandwidth through the BIG-IP.
     """
     end_time = time.time() + duration_seconds
+
+    # Generate random payload once per worker (reused across all handshakes).
+    # Random data doesn't compress, so BIG-IP processes the full payload.
+    payload = os.urandom(payload_kb * 1024) if payload_kb > 0 else None
 
     if engine == "native":
         # Build SSLContext once for this worker — reused for every handshake
@@ -482,6 +513,7 @@ def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
                 while time.time() < end_time:
                     batch_results = _run_batch_handshake(
                         ctx, target, sni, timeout, batch_size,
+                        payload=payload,
                     )
                     for result in batch_results:
                         f.write(f"{result.timestamp},{result.latency_ms},"
@@ -492,11 +524,12 @@ def worker_loop(target, tls_version, groups, cipher, tls13_cipher,
                 while time.time() < end_time:
                     result = run_native_handshake(
                         ctx=ctx, target=target, sni=sni, timeout=timeout,
+                        payload=payload,
                     )
                     f.write(f"{result.timestamp},{result.latency_ms},"
                             f"{result.success}\n")
     else:
-        # Legacy curl subprocess engine (no batching)
+        # Legacy curl subprocess engine (no batching, no payload)
         with open(results_file, "w") as f:
             while time.time() < end_time:
                 result = run_single_handshake(
@@ -658,7 +691,7 @@ def collect_bigip_metrics(bigip_host, username, password, poll_interval,
 
 def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
                       bigip_host, bigip_user, bigip_pass, poll_interval,
-                      engine="native", batch_size=1):
+                      engine="native", batch_size=1, payload_kb=0):
     """Run a complete load test scenario: spawn workers + collect BIG-IP metrics."""
     effective_conns = workers * batch_size
     w = 80
@@ -667,7 +700,8 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
     print(f"  Target: {scenario.target} | Groups: {scenario.groups}")
     print(f"  Workers: {workers} | Batch: {batch_size} | "
           f"Effective concurrency: {effective_conns} | Engine: {engine}")
-    print(f"  Duration: {duration}s")
+    payload_info = f"  Payload: {payload_kb} KB per connection\n" if payload_kb > 0 else ""
+    print(f"{payload_info}  Duration: {duration}s")
     print(f"{'=' * w}")
 
     # Verify the VIP is reachable with a quick handshake
@@ -711,7 +745,7 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
             args=(scenario.target, scenario.tls_version, scenario.groups,
                   scenario.cipher, scenario.tls13_cipher, duration,
                   insecure, sni, timeout, results_file, engine,
-                  batch_size),
+                  batch_size, payload_kb),
         )
         processes.append(p)
         p.start()
@@ -1088,6 +1122,11 @@ def main():
                         help="concurrent connections per worker (threaded). "
                              "Effective concurrency = workers × batch-size. "
                              "Native engine only. (default: 1)")
+    parser.add_argument("--payload-kb", type=int, default=0,
+                        help="send HTTP POST body of this size (KB) per connection "
+                             "to stress BIG-IP bandwidth. 0 = handshake only. "
+                             "For payloads > 1024 KB, increase nginx "
+                             "client_max_body_size. Native engine only. (default: 0)")
 
     args = parser.parse_args()
 
@@ -1133,11 +1172,24 @@ def main():
         batch_size = 1
     effective_conns = args.workers * batch_size
 
+    # Resolve payload
+    payload_kb = args.payload_kb
+    if payload_kb < 0:
+        payload_kb = 0
+    if engine == "curl" and payload_kb > 0:
+        print("WARNING: --payload-kb only works with native engine, ignoring.")
+        payload_kb = 0
+
     # Banner
     print(f"\nTLS Load Test — Non-PQC vs PQC Comparison")
     batch_info = f" × {batch_size} batch" if batch_size > 1 else ""
     print(f"Duration: {args.duration}s per scenario | Workers: {args.workers}"
           f"{batch_info} | Concurrency: {effective_conns} | Engine: {engine}")
+    if payload_kb > 0:
+        if payload_kb >= 1024:
+            print(f"Payload: {payload_kb / 1024:.1f} MB per connection")
+        else:
+            print(f"Payload: {payload_kb} KB per connection")
     print(f"Non-PQC VIP: {args.non_pqc_vip} ({args.non_pqc_groups})")
     print(f"PQC VIP:     {args.pqc_vip} ({args.pqc_groups})")
     print()
@@ -1176,6 +1228,7 @@ def main():
             poll_interval=args.poll_interval,
             engine=engine,
             batch_size=batch_size,
+            payload_kb=payload_kb,
         )
         if report:
             reports.append(report)
