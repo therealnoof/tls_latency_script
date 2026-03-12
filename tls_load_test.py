@@ -799,12 +799,27 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
 
     # Verify the VIP is reachable with a quick handshake
     print("  Verifying VIP connectivity...", end=" ")
-    probe = run_single_handshake(
-        target=scenario.target, tls_version=scenario.tls_version,
-        groups=scenario.groups, cipher=scenario.cipher,
-        tls13_cipher=scenario.tls13_cipher, timeout=timeout,
-        insecure=insecure, sni=sni,
-    )
+    if engine == "native":
+        try:
+            probe_ctx = _create_ssl_context(
+                tls_version=scenario.tls_version, groups=scenario.groups,
+                cipher=scenario.cipher, tls13_cipher=scenario.tls13_cipher,
+                insecure=insecure,
+            )
+            probe = run_native_handshake(
+                ctx=probe_ctx, target=scenario.target, sni=sni,
+                timeout=timeout,
+            )
+        except RuntimeError:
+            probe = HandshakeResult(timestamp=time.time(), latency_ms=0,
+                                    success=False)
+    else:
+        probe = run_single_handshake(
+            target=scenario.target, tls_version=scenario.tls_version,
+            groups=scenario.groups, cipher=scenario.cipher,
+            tls13_cipher=scenario.tls13_cipher, timeout=timeout,
+            insecure=insecure, sni=sni,
+        )
     if not probe.success:
         print("FAILED")
         print(f"  ERROR: Cannot complete TLS handshake to {scenario.target}")

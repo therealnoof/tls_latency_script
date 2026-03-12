@@ -213,10 +213,10 @@ docker compose logs -f
    which curl
    curl --version
    ```
-   If it shows the old system curl (7.x), set the path:
+   If it shows the old system curl (7.x), set the path for the **current session only** (do **not** add to `.bashrc` — see warning in README):
    ```bash
    export PATH=/usr/local/bin:$PATH
-   export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/openssl-3.5/lib64:$LD_LIBRARY_PATH
+   export LD_LIBRARY_PATH=/usr/local/openssl-3.5/lib64
    ```
 
 3. **Check F5 VIP status** — Ensure both virtual servers are available and pool members are healthy:

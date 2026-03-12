@@ -71,21 +71,41 @@ make install
 
 > **Tip:** If OpenSSL installed its libs to `lib/` instead of `lib64/`, swap `lib64` to `lib` in the export lines above. Check with: `ls /usr/local/openssl-3.5/lib64/libssl.* 2>/dev/null || ls /usr/local/openssl-3.5/lib/libssl.*`
 
-### 4. Configure library and binary paths
+### 4. Prevent system linker from loading custom OpenSSL
 
-The new curl installs to `/usr/local/bin/curl` and needs both its own `libcurl` and the OpenSSL 3.5 shared libs at runtime:
+> **⚠️ CRITICAL:** Do **not** add `LD_LIBRARY_PATH` to `.bashrc` or any shell profile. Doing so causes system services (sshd, systemd, etc.) to load the custom OpenSSL instead of the distro version, which can **prevent the machine from booting**.
+
+Ensure `/usr/local/lib` is **not** in the system linker config:
 
 ```bash
-echo 'export PATH=/usr/local/bin:$PATH' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/openssl-3.5/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
-source ~/.bashrc
+# Check for any config that adds /usr/local/lib to the linker path
+grep -r "local" /etc/ld.so.conf.d/
+
+# If /etc/ld.so.conf.d/libc.conf exists and contains /usr/local/lib, remove it:
+sudo rm /etc/ld.so.conf.d/libc.conf
+
+# Rebuild linker cache
+sudo ldconfig
+
+# Verify system sshd uses the DISTRO OpenSSL (not /usr/local)
+ldd /usr/sbin/sshd | grep -E "ssl|crypto"
+# Should show /lib/x86_64-linux-gnu/ paths only
 ```
 
-### 5. Verify
+### 5. Verify (using LD_LIBRARY_PATH for current session only)
+
+Set `LD_LIBRARY_PATH` in the current shell session — **not** in `.bashrc`:
 
 ```bash
+export LD_LIBRARY_PATH=/usr/local/openssl-3.5/lib64
 which curl        # should show /usr/local/bin/curl
 curl --version    # should show curl 8.12.1 ... OpenSSL/3.5.0
+```
+
+For running the test tools, use the wrapper script (see below) or set `LD_LIBRARY_PATH` inline:
+
+```bash
+LD_LIBRARY_PATH=/usr/local/openssl-3.5/lib64 python3 tls_latency_bench.py -t 10.1.10.20 -k
 ```
 
 ## Test Matrix
