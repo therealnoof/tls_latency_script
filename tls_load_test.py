@@ -184,22 +184,32 @@ def _load_libssl():
 
     Tries multiple strategies since ctypes.util.find_library() often fails
     on systems with custom OpenSSL builds (e.g. /usr/local/openssl-3.5).
-    """
-    # Strategy 1: CDLL(None) — access symbols already loaded into the process.
-    # Since Python's _ssl module links against libssl, the symbol
-    # SSL_CTX_set1_groups_list should already be in the process address space.
-    try:
-        handle = ctypes.CDLL(None)
-        # Verify the function exists in loaded symbols
-        handle.SSL_CTX_set1_groups_list
-        return handle
-    except (OSError, AttributeError):
-        pass
 
-    # Strategy 2: Try common Linux .so names for OpenSSL 3.x
+    Returns (handle, path_info) or (None, reason).
+    """
+    # Strategy 1: Read /proc/self/maps to find the exact libssl loaded by
+    # Python's _ssl module. This is the most reliable method on Linux since
+    # it finds the actual library in memory regardless of LD_LIBRARY_PATH
+    # or ldconfig configuration.
+    try:
+        with open("/proc/self/maps", "r") as f:
+            for line in f:
+                if "libssl" in line and ".so" in line:
+                    path = line.strip().split()[-1]
+                    if path.startswith("/") and os.path.isfile(path):
+                        try:
+                            handle = ctypes.CDLL(path)
+                            return handle, path
+                        except OSError:
+                            continue
+    except (OSError, IOError):
+        pass  # Not on Linux, or /proc not available
+
+    # Strategy 2: Try common .so names (may load system default, not custom)
     for name in ("libssl.so.3", "libssl.so", "libssl.3.dylib"):
         try:
-            return ctypes.CDLL(name)
+            handle = ctypes.CDLL(name)
+            return handle, name
         except OSError:
             continue
 
@@ -207,20 +217,31 @@ def _load_libssl():
     try:
         libssl_name = ctypes.util.find_library("ssl")
         if libssl_name:
-            return ctypes.CDLL(libssl_name)
+            handle = ctypes.CDLL(libssl_name)
+            return handle, libssl_name
     except OSError:
         pass
 
-    return None
+    return None, "all strategies failed"
+
+
+# SSL_CTX_ctrl command code for setting key exchange groups.
+# SSL_CTX_set1_groups_list(ctx, str) is a MACRO that expands to:
+#   SSL_CTX_ctrl(ctx, SSL_CTRL_SET_GROUPS_LIST, 0, str)
+# We must call SSL_CTX_ctrl directly because macros don't exist as
+# symbols in the shared library and ctypes can't resolve them.
+_SSL_CTRL_SET_GROUPS_LIST = 92
 
 
 def _try_set_groups_ctypes(ctx, groups_str):
-    """Attempt to set key exchange groups via ctypes calling SSL_CTX_set1_groups_list.
+    """Set key exchange groups via ctypes calling SSL_CTX_ctrl.
 
-    This is a fallback for Python versions where set_ecdh_curve() does not call
-    the modern groups API. Only attempted when Python's ssl module is linked
-    against OpenSSL (not LibreSSL) version 3.2+.
+    Python <3.13 set_ecdh_curve() uses the old EC_KEY API which does not
+    support X25519 or PQC groups. This function calls SSL_CTX_ctrl() with
+    SSL_CTRL_SET_GROUPS_LIST (92) directly — the same call that the
+    SSL_CTX_set1_groups_list macro expands to.
 
+    Only attempted when Python's ssl module is linked against OpenSSL 3.2+.
     Returns True on success, False on failure.
     """
     # Only safe when Python's ssl is linked against OpenSSL (not LibreSSL)
@@ -231,14 +252,15 @@ def _try_set_groups_ctypes(ctx, groups_str):
         return False
 
     try:
-        libssl = _load_libssl()
+        libssl, _path = _load_libssl()
         if not libssl:
             return False
 
-        # SSL_CTX_set1_groups_list(SSL_CTX *ctx, const char *str) → int
-        func = libssl.SSL_CTX_set1_groups_list
-        func.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        func.restype = ctypes.c_int
+        # long SSL_CTX_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
+        func = libssl.SSL_CTX_ctrl
+        func.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                         ctypes.c_long, ctypes.c_char_p]
+        func.restype = ctypes.c_long
 
         # Extract the SSL_CTX* pointer from the Python SSLContext object.
         # In CPython, PySSLContext layout is:
@@ -251,7 +273,8 @@ def _try_set_groups_ctypes(ctx, groups_str):
         if not ssl_ctx_ptr:
             return False
 
-        result = func(ssl_ctx_ptr, groups_str.encode("ascii"))
+        result = func(ssl_ctx_ptr, _SSL_CTRL_SET_GROUPS_LIST, 0,
+                      groups_str.encode("ascii"))
         return result == 1
     except (OSError, AttributeError, TypeError, ValueError):
         return False
@@ -380,14 +403,14 @@ def probe_native_support(groups_list):
     print(f"    TLS 1.3 support:   {getattr(ssl, 'HAS_TLSv1_3', False)}",
           file=sys.stderr)
     # Check if ctypes can find libssl
-    libssl = _load_libssl()
+    libssl, libssl_path = _load_libssl()
     if libssl:
-        print(f"    ctypes libssl:     loaded OK", file=sys.stderr)
-        has_func = hasattr(libssl, "SSL_CTX_set1_groups_list")
-        print(f"    groups_list func:  {'found' if has_func else 'NOT FOUND'}",
+        print(f"    ctypes libssl:     {libssl_path}", file=sys.stderr)
+        has_ctrl = hasattr(libssl, "SSL_CTX_ctrl")
+        print(f"    SSL_CTX_ctrl:      {'found' if has_ctrl else 'NOT FOUND'}",
               file=sys.stderr)
     else:
-        print(f"    ctypes libssl:     FAILED to load", file=sys.stderr)
+        print(f"    ctypes libssl:     FAILED ({libssl_path})", file=sys.stderr)
     for err in errors:
         print(f"    Error: {err}", file=sys.stderr)
 
