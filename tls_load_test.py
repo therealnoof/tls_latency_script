@@ -80,8 +80,8 @@ class BigIPMetricSample:
     tmm_cpu_pct: float
     active_ssl_connections: int
     ssl_transactions_per_sec: float
-    throughput_in_mbps: float = 0.0
-    throughput_out_mbps: float = 0.0
+    throughput_in_pps: float = 0.0
+    throughput_out_pps: float = 0.0
 
 
 @dataclass
@@ -107,10 +107,10 @@ class ScenarioReport:
     bigip_tmm_cpu_max: float = 0.0
     bigip_ssl_tps_avg: float = 0.0
     bigip_ssl_tps_max: float = 0.0
-    bigip_throughput_in_avg_mbps: float = 0.0
-    bigip_throughput_in_max_mbps: float = 0.0
-    bigip_throughput_out_avg_mbps: float = 0.0
-    bigip_throughput_out_max_mbps: float = 0.0
+    bigip_throughput_in_avg_pps: float = 0.0
+    bigip_throughput_in_max_pps: float = 0.0
+    bigip_throughput_out_avg_pps: float = 0.0
+    bigip_throughput_out_max_pps: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -557,9 +557,21 @@ def _stat_val(entry, key, default=0):
       - sys/cpu, sys/memory, sys/tmm-info:  {"key": {"value": 42}}
       - sys/performance/all-stats:          {"key": {"description": "42"}}
 
-    This helper tries both and returns a numeric value.
+    All-stats sub-entry keys are capitalised (``Current``, ``Average``),
+    so this helper performs a case-insensitive lookup when the exact key
+    is not found.
     """
-    item = entry.get(key, {})
+    # Exact match first (fast path)
+    item = entry.get(key)
+    # Case-insensitive fallback
+    if item is None:
+        key_lower = key.lower()
+        for k, v in entry.items():
+            if k.lower() == key_lower:
+                item = v
+                break
+    if item is None:
+        return default
     if isinstance(item, dict):
         # Try "value" first (sys/cpu, sys/memory, sys/tmm-info)
         if "value" in item:
@@ -631,51 +643,58 @@ def _parse_tmm_cpu(tmm_data):
 
 
 def _parse_ssl_stats(perf_data):
-    """Extract SSL and throughput stats from /mgmt/tm/sys/performance/all-stats.
+    """Extract SSL, throughput, CPU and connection stats from all-stats.
 
-    BIG-IP all-stats uses "description" for values (not "value"), and the
-    throughput entry contains "In"/"Out"/"Service" as direct sub-entries
-    rather than "current"/"average"/"max".
+    BIG-IP ``/mgmt/tm/sys/performance/all-stats`` response layout (from a
+    real 17.1 VE)::
 
-    Typical keys:
-      .../SSL%20Transactions       → entries: current (TPS)
-      .../SSL%20Concurrent%20...   → entries: current (connections)
-      .../Throughput(bits)         → entries: In, Out, Service (bits/sec)
+        Top-level key (URL-encoded)   Sub-entries (Capitalised!)
+        ----------------------------  ---------------------------
+        SSL%20TPS                     Average, Current, Max(…)
+        Client%20Connections          Average, Current, Max(…)
+        In                            Average, Current, Max(…)   ← packets/sec IN
+        Out                           Average, Current, Max(…)   ← packets/sec OUT
+        Utilization                   Average, Current, Max(…)   ← System CPU %
+
+    Sub-entry values are stored as ``{"description": "<number>"}``
+    and sub-entry keys are **Capitalised** (``Current`` not ``current``).
     """
     ssl_conns = 0
     ssl_tps = 0.0
-    throughput_in_mbps = 0.0
-    throughput_out_mbps = 0.0
+    throughput_in_pps = 0.0   # packets per second
+    throughput_out_pps = 0.0
+    cpu_pct = 0.0
     try:
         entries = perf_data.get("entries", {})
         for key, val in entries.items():
             nested = val.get("nestedStats", {}).get("entries", {})
-            key_lower = key.lower()
+            # Use the last path segment as short key, e.g. "SSL%20TPS"
+            short_key = key.rsplit("/", 1)[-1] if "/" in key else key
+            short_lower = short_key.lower()
 
-            # SSL Transactions → TPS
-            if "ssl" in key_lower and "transaction" in key_lower:
-                ssl_tps = _stat_val(nested, "current")
+            # SSL TPS  (key: "SSL%20TPS" → "ssl%20tps")
+            if "ssl" in short_lower and "tps" in short_lower:
+                ssl_tps = _stat_val(nested, "Current")
 
-            # SSL Concurrent Connections
-            elif "ssl" in key_lower and ("conn" in key_lower
-                                         or "concurrent" in key_lower):
-                ssl_conns = int(_stat_val(nested, "current"))
+            # Client Connections  (key: "Client%20Connections")
+            elif "client" in short_lower and "connection" in short_lower:
+                ssl_conns = int(_stat_val(nested, "Current"))
 
-            # Throughput(bits) → In/Out in bits/sec
-            # The throughput entry has In/Out/Service as direct sub-entries
-            elif "throughput" in key_lower:
-                tp_in = _stat_val(nested, "In")
-                tp_out = _stat_val(nested, "Out")
-                # Also try "current" structure as fallback
-                if tp_in == 0 and tp_out == 0:
-                    tp_in = _stat_val(nested, "current")
-                if tp_in > 0:
-                    throughput_in_mbps = tp_in / 1_000_000  # bits → Mbps
-                if tp_out > 0:
-                    throughput_out_mbps = tp_out / 1_000_000  # bits → Mbps
+            # Throughput IN  (key: "In", description contains "Throughput")
+            elif short_lower == "in":
+                throughput_in_pps = _stat_val(nested, "Current")
+
+            # Throughput OUT  (key: "Out")
+            elif short_lower == "out":
+                throughput_out_pps = _stat_val(nested, "Current")
+
+            # System CPU Utilization  (key: "Utilization")
+            elif short_lower == "utilization":
+                cpu_pct = _stat_val(nested, "Current")
+
     except (KeyError, TypeError, ValueError):
         pass
-    return ssl_conns, ssl_tps, throughput_in_mbps, throughput_out_mbps
+    return ssl_conns, ssl_tps, throughput_in_pps, throughput_out_pps, cpu_pct
 
 
 _bigip_stats_debug_printed = False
@@ -723,7 +742,11 @@ def fetch_bigip_stats(session, base_url):
         cpu_pct = _parse_cpu(cpu_data)
         mem_pct = _parse_memory(mem_data)
         tmm_cpu = _parse_tmm_cpu(tmm_data)
-        ssl_conns, ssl_tps, tp_in, tp_out = _parse_ssl_stats(perf_data)
+        ssl_conns, ssl_tps, tp_in, tp_out, allstats_cpu = _parse_ssl_stats(perf_data)
+
+        # Use all-stats CPU when sys/cpu parser returns 0 (format mismatch)
+        if cpu_pct == 0.0 and allstats_cpu > 0:
+            cpu_pct = allstats_cpu
 
         return BigIPMetricSample(
             timestamp=time.time(),
@@ -732,8 +755,8 @@ def fetch_bigip_stats(session, base_url):
             tmm_cpu_pct=tmm_cpu,
             active_ssl_connections=ssl_conns,
             ssl_transactions_per_sec=ssl_tps,
-            throughput_in_mbps=tp_in,
-            throughput_out_mbps=tp_out,
+            throughput_in_pps=tp_in,
+            throughput_out_pps=tp_out,
         )
     except requests.RequestException as e:
         print(f"  WARNING: BIG-IP metric poll failed: {e}", file=sys.stderr)
@@ -830,12 +853,12 @@ def run_load_scenario(scenario, workers, duration, insecure, sni, timeout,
             m = metrics_list[-1]
             latest_tmm = f"{m.tmm_cpu_pct:.0f}"
             latest_tps = f"{m.ssl_transactions_per_sec:.0f}"
-            latest_tp = f"{m.throughput_in_mbps + m.throughput_out_mbps:.0f}"
+            latest_tp = f"{m.throughput_in_pps + m.throughput_out_pps:.0f}"
         else:
             latest_tmm = latest_tps = latest_tp = "N/A"
         print(f"\r  [{elapsed:>5.0f}s / {duration}s] "
               f"TMM: {latest_tmm}%  SSL TPS: {latest_tps}  "
-              f"Throughput: {latest_tp} Mbps  "
+              f"Throughput: {latest_tp} pps  "
               f"Remaining: {remaining:.0f}s   ", end="", flush=True)
         # Short sleep so we detect worker completion quickly
         time.sleep(2)
@@ -903,8 +926,8 @@ def compute_scenario_report(scenario, results, metrics, elapsed):
     mem_vals = [m.memory_used_pct for m in metrics]
     tmm_vals = [m.tmm_cpu_pct for m in metrics]
     ssl_tps_vals = [m.ssl_transactions_per_sec for m in metrics]
-    tp_in_vals = [m.throughput_in_mbps for m in metrics]
-    tp_out_vals = [m.throughput_out_mbps for m in metrics]
+    tp_in_vals = [m.throughput_in_pps for m in metrics]
+    tp_out_vals = [m.throughput_out_pps for m in metrics]
 
     return ScenarioReport(
         scenario=scenario,
@@ -928,10 +951,10 @@ def compute_scenario_report(scenario, results, metrics, elapsed):
         bigip_tmm_cpu_max=max(tmm_vals) if tmm_vals else 0.0,
         bigip_ssl_tps_avg=statistics.mean(ssl_tps_vals) if ssl_tps_vals else 0.0,
         bigip_ssl_tps_max=max(ssl_tps_vals) if ssl_tps_vals else 0.0,
-        bigip_throughput_in_avg_mbps=statistics.mean(tp_in_vals) if tp_in_vals else 0.0,
-        bigip_throughput_in_max_mbps=max(tp_in_vals) if tp_in_vals else 0.0,
-        bigip_throughput_out_avg_mbps=statistics.mean(tp_out_vals) if tp_out_vals else 0.0,
-        bigip_throughput_out_max_mbps=max(tp_out_vals) if tp_out_vals else 0.0,
+        bigip_throughput_in_avg_pps=statistics.mean(tp_in_vals) if tp_in_vals else 0.0,
+        bigip_throughput_in_max_pps=max(tp_in_vals) if tp_in_vals else 0.0,
+        bigip_throughput_out_avg_pps=statistics.mean(tp_out_vals) if tp_out_vals else 0.0,
+        bigip_throughput_out_max_pps=max(tp_out_vals) if tp_out_vals else 0.0,
     )
 
 
@@ -947,10 +970,10 @@ def print_comparison_report(reports):
     print(f"{'=' * w}")
 
     for report in reports:
-        tp_in = report.bigip_throughput_in_avg_mbps
-        tp_out = report.bigip_throughput_out_avg_mbps
-        tp_in_max = report.bigip_throughput_in_max_mbps
-        tp_out_max = report.bigip_throughput_out_max_mbps
+        tp_in = report.bigip_throughput_in_avg_pps
+        tp_out = report.bigip_throughput_out_avg_pps
+        tp_in_max = report.bigip_throughput_in_max_pps
+        tp_out_max = report.bigip_throughput_out_max_pps
 
         print(f"\n  {report.scenario.label} ({report.scenario.target})")
         print(f"  {'-' * 60}")
@@ -972,8 +995,8 @@ def print_comparison_report(reports):
               f"max={report.bigip_mem_max:.1f}%")
         print(f"  BIG-IP SSL TPS:     avg={report.bigip_ssl_tps_avg:.0f}  "
               f"max={report.bigip_ssl_tps_max:.0f}")
-        print(f"  BIG-IP Throughput:  in={tp_in:.1f} Mbps (max {tp_in_max:.1f})  "
-              f"out={tp_out:.1f} Mbps (max {tp_out_max:.1f})")
+        print(f"  BIG-IP Throughput:  in={tp_in:.0f} pps (max {tp_in_max:.0f})  "
+              f"out={tp_out:.0f} pps (max {tp_out_max:.0f})")
 
     # Delta comparison
     if len(reports) == 2:
@@ -1006,12 +1029,12 @@ def print_comparison_report(reports):
                          / base.bigip_ssl_tps_avg * 100)
             print(f"  SSL TPS:            {tps_delta:+.1f}%")
 
-        base_tp = base.bigip_throughput_in_avg_mbps + base.bigip_throughput_out_avg_mbps
-        pqc_tp = pqc.bigip_throughput_in_avg_mbps + pqc.bigip_throughput_out_avg_mbps
+        base_tp = base.bigip_throughput_in_avg_pps + base.bigip_throughput_out_avg_pps
+        pqc_tp = pqc.bigip_throughput_in_avg_pps + pqc.bigip_throughput_out_avg_pps
         if base_tp > 0:
             tp_delta = ((pqc_tp - base_tp) / base_tp * 100)
             print(f"  Throughput:         {tp_delta:+.1f}% "
-                  f"({base_tp:.1f} → {pqc_tp:.1f} Mbps)")
+                  f"({base_tp:.0f} → {pqc_tp:.0f} pps)")
 
     print(f"\n{'=' * w}")
 
@@ -1034,8 +1057,8 @@ def export_csv(reports, path):
             "bigip_cpu_avg,bigip_cpu_max,bigip_mem_avg,bigip_mem_max,"
             "bigip_tmm_cpu_avg,bigip_tmm_cpu_max,"
             "bigip_ssl_tps_avg,bigip_ssl_tps_max,"
-            "bigip_throughput_in_avg_mbps,bigip_throughput_in_max_mbps,"
-            "bigip_throughput_out_avg_mbps,bigip_throughput_out_max_mbps\n"
+            "bigip_throughput_in_avg_pps,bigip_throughput_in_max_pps,"
+            "bigip_throughput_out_avg_pps,bigip_throughput_out_max_pps\n"
         )
         for r in reports:
             f.write(
@@ -1050,8 +1073,8 @@ def export_csv(reports, path):
                 f'{r.bigip_mem_avg:.1f},{r.bigip_mem_max:.1f},'
                 f'{r.bigip_tmm_cpu_avg:.1f},{r.bigip_tmm_cpu_max:.1f},'
                 f'{r.bigip_ssl_tps_avg:.0f},{r.bigip_ssl_tps_max:.0f},'
-                f'{r.bigip_throughput_in_avg_mbps:.1f},{r.bigip_throughput_in_max_mbps:.1f},'
-                f'{r.bigip_throughput_out_avg_mbps:.1f},{r.bigip_throughput_out_max_mbps:.1f}\n'
+                f'{r.bigip_throughput_in_avg_pps:.1f},{r.bigip_throughput_in_max_pps:.1f},'
+                f'{r.bigip_throughput_out_avg_pps:.1f},{r.bigip_throughput_out_max_pps:.1f}\n'
             )
     print(f"  Summary:     {summary_path}")
 
@@ -1061,7 +1084,7 @@ def export_csv(reports, path):
         f.write(
             "scenario,timestamp,elapsed_s,cpu_pct,memory_pct,"
             "tmm_cpu_pct,active_ssl_conns,ssl_tps,"
-            "throughput_in_mbps,throughput_out_mbps\n"
+            "throughput_in_pps,throughput_out_pps\n"
         )
         for r in reports:
             start_ts = r.bigip_metrics[0].timestamp if r.bigip_metrics else 0
@@ -1072,7 +1095,7 @@ def export_csv(reports, path):
                     f'{m.cpu_utilization:.1f},{m.memory_used_pct:.1f},'
                     f'{m.tmm_cpu_pct:.1f},{m.active_ssl_connections},'
                     f'{m.ssl_transactions_per_sec:.1f},'
-                    f'{m.throughput_in_mbps:.1f},{m.throughput_out_mbps:.1f}\n'
+                    f'{m.throughput_in_pps:.1f},{m.throughput_out_pps:.1f}\n'
                 )
     print(f"  Time-series: {metrics_path}")
 
