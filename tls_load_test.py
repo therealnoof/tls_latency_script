@@ -179,6 +179,41 @@ def _get_openssl_version_tuple():
     return (0, 0, 0)
 
 
+def _load_libssl():
+    """Locate and load the libssl shared library that Python's ssl module uses.
+
+    Tries multiple strategies since ctypes.util.find_library() often fails
+    on systems with custom OpenSSL builds (e.g. /usr/local/openssl-3.5).
+    """
+    # Strategy 1: CDLL(None) — access symbols already loaded into the process.
+    # Since Python's _ssl module links against libssl, the symbol
+    # SSL_CTX_set1_groups_list should already be in the process address space.
+    try:
+        handle = ctypes.CDLL(None)
+        # Verify the function exists in loaded symbols
+        handle.SSL_CTX_set1_groups_list
+        return handle
+    except (OSError, AttributeError):
+        pass
+
+    # Strategy 2: Try common Linux .so names for OpenSSL 3.x
+    for name in ("libssl.so.3", "libssl.so", "libssl.3.dylib"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+
+    # Strategy 3: ctypes.util.find_library (works when ldconfig is up to date)
+    try:
+        libssl_name = ctypes.util.find_library("ssl")
+        if libssl_name:
+            return ctypes.CDLL(libssl_name)
+    except OSError:
+        pass
+
+    return None
+
+
 def _try_set_groups_ctypes(ctx, groups_str):
     """Attempt to set key exchange groups via ctypes calling SSL_CTX_set1_groups_list.
 
@@ -196,11 +231,9 @@ def _try_set_groups_ctypes(ctx, groups_str):
         return False
 
     try:
-        # Find the libssl that Python is already linked against
-        libssl_name = ctypes.util.find_library("ssl")
-        if not libssl_name:
+        libssl = _load_libssl()
+        if not libssl:
             return False
-        libssl = ctypes.CDLL(libssl_name)
 
         # SSL_CTX_set1_groups_list(SSL_CTX *ctx, const char *str) → int
         func = libssl.SSL_CTX_set1_groups_list
@@ -208,10 +241,15 @@ def _try_set_groups_ctypes(ctx, groups_str):
         func.restype = ctypes.c_int
 
         # Extract the SSL_CTX* pointer from the Python SSLContext object.
-        # In CPython, PySSLContext has: PyObject_HEAD (2 pointers) then SSL_CTX*.
+        # In CPython, PySSLContext layout is:
+        #   PyObject_HEAD  →  ob_refcnt (Py_ssize_t) + ob_type (pointer)
+        #   SSL_CTX *ctx   →  the pointer we need
+        # On 64-bit Linux: offset = 16 bytes (2 × 8-byte pointers)
         ptr_size = ctypes.sizeof(ctypes.c_void_p)
         offset = 2 * ptr_size  # skip ob_refcnt + ob_type
         ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + offset).value
+        if not ssl_ctx_ptr:
+            return False
 
         result = func(ssl_ctx_ptr, groups_str.encode("ascii"))
         return result == 1
@@ -324,14 +362,35 @@ def probe_native_support(groups_list):
         (supported: bool, details: str) — True if ALL groups are supported natively.
     """
     unsupported = []
+    errors = []
     for groups_str in groups_list:
         try:
             _create_ssl_context(tls_version="1.3", groups=groups_str, insecure=True)
-        except (RuntimeError, ssl.SSLError, Exception):
+        except (RuntimeError, ssl.SSLError, Exception) as e:
             unsupported.append(groups_str)
+            errors.append(f"{groups_str}: {e}")
 
     if not unsupported:
         return True, "All requested groups supported natively"
+
+    # Print diagnostic details to help troubleshoot
+    print(f"  Native SSL probe details:", file=sys.stderr)
+    print(f"    Python ssl linked: {ssl.OPENSSL_VERSION}", file=sys.stderr)
+    print(f"    Python version:    {sys.version.split()[0]}", file=sys.stderr)
+    print(f"    TLS 1.3 support:   {getattr(ssl, 'HAS_TLSv1_3', False)}",
+          file=sys.stderr)
+    # Check if ctypes can find libssl
+    libssl = _load_libssl()
+    if libssl:
+        print(f"    ctypes libssl:     loaded OK", file=sys.stderr)
+        has_func = hasattr(libssl, "SSL_CTX_set1_groups_list")
+        print(f"    groups_list func:  {'found' if has_func else 'NOT FOUND'}",
+              file=sys.stderr)
+    else:
+        print(f"    ctypes libssl:     FAILED to load", file=sys.stderr)
+    for err in errors:
+        print(f"    Error: {err}", file=sys.stderr)
+
     return False, f"Unsupported groups: {', '.join(unsupported)}"
 
 
